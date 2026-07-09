@@ -1,0 +1,274 @@
+import copy
+from typing import Optional, Tuple, Union
+
+import torch
+from torch import nn
+from torch.nn import CrossEntropyLoss
+import warnings
+from dataclasses import dataclass
+
+from transformers.models.t5.modeling_t5 import (
+    T5ForConditionalGeneration,
+    T5Config,
+    T5Stack,
+)
+from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
+from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward
+from transformers.utils.logging import get_logger
+
+# These constants were removed in transformers v5.x — provide empty placeholders
+T5_START_DOCSTRING = ""
+T5_INPUTS_DOCSTRING = ""
+PARALLELIZE_DOCSTRING = ""
+DEPARALLELIZE_DOCSTRING = ""
+__HEAD_MASK_WARNING_MSG = ""
+
+# model_parallel_utils was removed in transformers v5.x — provide minimal stubs
+def assert_device_map(device_map, num_layers):
+    pass
+
+def get_device_map(num_layers, devices):
+    return {}
+
+logger = get_logger("transformers")
+
+
+class InteractionModule(nn.Module):
+    def __init__(self, hid_dim):
+        super(InteractionModule, self).__init__()
+        self.linear = nn.Linear(hid_dim, hid_dim)
+
+    def forward(self, inputs, mask1=None, mask2=None):
+        transformed_inputs = self.linear(inputs)
+        interaction_matrix = torch.einsum("bik,bjk->bij", inputs, transformed_inputs)
+
+        if mask1 is not None and mask2 is not None:
+            mask1 = mask1.unsqueeze(2)
+            mask2 = mask2.unsqueeze(1)
+            mask = (mask1 * mask2).to(interaction_matrix.dtype)
+            interaction_matrix *= mask
+            denom = mask.sum(dim=(1, 2)).clamp_min(1.0)
+            output = interaction_matrix.sum(dim=(1, 2)) / denom
+            return output
+
+        output = interaction_matrix.mean(dim=(1, 2))
+        return output
+
+
+@dataclass
+class MyDTISeq2SeqLMOutput(Seq2SeqLMOutput):
+    pred_logits: torch.FloatTensor = None
+
+
+@add_start_docstrings(
+    """T5 multitask model for DTI explanation generation and classification.""",
+    T5_START_DOCSTRING
+)
+class T5ForConditionalGenerationDTIMultTask(T5ForConditionalGeneration):
+    _keys_to_ignore_on_load_missing = [
+        r"encoder.embed_tokens.weight",
+        r"decoder.embed_tokens.weight",
+        r"lm_head.weight",
+    ]
+    _keys_to_ignore_on_load_unexpected = [
+        r"decoder.block.0.layer.1.EncDecAttention.relative_attention_bias.weight",
+    ]
+
+    def __init__(self, config: T5Config):
+        super().__init__(config)
+        self.model_dim = config.d_model
+        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+
+        encoder_config = copy.deepcopy(config)
+        encoder_config.is_decoder = False
+        encoder_config.is_encoder_decoder = False
+        encoder_config.use_cache = False
+        self.encoder = T5Stack(encoder_config, self.shared)
+
+        decoder_config = copy.deepcopy(config)
+        decoder_config.is_decoder = True
+        decoder_config.is_encoder_decoder = False
+        decoder_config.num_layers = config.num_decoder_layers
+        self.decoder = T5Stack(decoder_config, self.shared)
+
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        classifier_dropout = (
+            config.classifier_dropout if hasattr(config, "classifier_dropout") else config.dropout_rate
+        )
+        self.dropout = nn.Dropout(classifier_dropout)
+        self.classifier = InteractionModule(config.d_model)
+
+        self.post_init()
+        self.model_parallel = False
+        self.device_map = None
+
+    def get_input_embeddings(self):
+        return self.shared
+
+    def set_input_embeddings(self, new_embeddings):
+        self.shared = new_embeddings
+        self.encoder.set_input_embeddings(new_embeddings)
+        self.decoder.set_input_embeddings(new_embeddings)
+
+    def get_encoder(self):
+        return self.encoder
+
+    @add_start_docstrings(PARALLELIZE_DOCSTRING)
+    def parallelize(self, device_map=None):
+        warnings.warn(
+            "`T5ForConditionalGeneration.parallelize` is deprecated and will be removed in v5 of Transformers.",
+            FutureWarning,
+        )
+        self.device_map = (
+            get_device_map(len(self.encoder.block), range(torch.cuda.device_count()))
+            if device_map is None
+            else device_map
+        )
+        assert_device_map(self.device_map, len(self.encoder.block))
+        self.encoder.parallelize(self.device_map)
+        self.decoder.parallelize(self.device_map)
+        self.classifier = self.classifier.to(self.encoder.first_device)
+        self.lm_head = self.lm_head.to(self.decoder.first_device)
+        self.model_parallel = True
+
+    @add_start_docstrings(DEPARALLELIZE_DOCSTRING)
+    def deparallelize(self):
+        warnings.warn("Like `parallelize`, `deparallelize` is deprecated and will be removed in v5 of Transformers.", FutureWarning)
+        self.encoder.deparallelize()
+        self.decoder.deparallelize()
+        self.encoder = self.encoder.to("cpu")
+        self.decoder = self.decoder.to("cpu")
+        self.classifier = self.classifier.to("cpu")
+        self.lm_head = self.lm_head.to("cpu")
+        self.model_parallel = False
+        self.device_map = None
+        torch.cuda.empty_cache()
+
+    @add_start_docstrings_to_model_forward(T5_INPUTS_DOCSTRING)
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        drug_mask: Optional[torch.FloatTensor] = None,
+        target_mask: Optional[torch.FloatTensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        decoder_head_mask: Optional[torch.FloatTensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        cls_labels: Optional[torch.LongTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position=None,
+    ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if head_mask is not None and decoder_head_mask is None:
+            if self.config.num_layers == self.config.num_decoder_layers:
+                warnings.warn(__HEAD_MASK_WARNING_MSG, FutureWarning)
+                decoder_head_mask = head_mask
+
+        if encoder_outputs is None:
+            encoder_outputs = self.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                head_mask=head_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
+            encoder_outputs = BaseModelOutput(
+                last_hidden_state=encoder_outputs[0],
+                hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
+                attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
+            )
+
+        hidden_states = encoder_outputs[0]
+        pred_output = self.classifier(hidden_states, drug_mask, target_mask)
+
+        pred_loss = None
+        if cls_labels is not None:
+            pred_criterion = nn.BCEWithLogitsLoss()
+            pred_loss = pred_criterion(pred_output, cls_labels)
+
+        if self.model_parallel:
+            torch.cuda.set_device(self.decoder.first_device)
+
+        if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
+            decoder_input_ids = self._shift_right(labels)
+
+        if self.model_parallel:
+            torch.cuda.set_device(self.decoder.first_device)
+            hidden_states = hidden_states.to(self.decoder.first_device)
+            if decoder_input_ids is not None:
+                decoder_input_ids = decoder_input_ids.to(self.decoder.first_device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.decoder.first_device)
+            if decoder_attention_mask is not None:
+                decoder_attention_mask = decoder_attention_mask.to(self.decoder.first_device)
+
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            inputs_embeds=decoder_inputs_embeds,
+            past_key_values=past_key_values,
+            encoder_hidden_states=hidden_states,
+            encoder_attention_mask=attention_mask,
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = decoder_outputs[0]
+
+        if self.model_parallel:
+            torch.cuda.set_device(self.encoder.first_device)
+            self.lm_head = self.lm_head.to(self.encoder.first_device)
+            sequence_output = sequence_output.to(self.lm_head.weight.device)
+
+        if self.config.tie_word_embeddings:
+            sequence_output = sequence_output * (self.model_dim ** -0.5)
+
+        lm_logits = self.lm_head(sequence_output)
+
+        decoder_loss = None
+        if labels is not None:
+            decoder_loss_fct = CrossEntropyLoss(ignore_index=-100)
+            labels = labels.to(lm_logits.device)
+            decoder_loss = decoder_loss_fct(lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1))
+
+        if decoder_loss is not None and pred_loss is not None:
+            loss = 0.5 * decoder_loss + 0.5 * pred_loss
+        else:
+            loss = None
+
+        if not return_dict:
+            output = (lm_logits, pred_output) + decoder_outputs[1:] + encoder_outputs
+            return ((loss,) + output) if loss is not None else output
+
+        return MyDTISeq2SeqLMOutput(
+            loss=loss,
+            logits=lm_logits,
+            pred_logits=pred_output,
+            past_key_values=decoder_outputs.past_key_values,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+        )

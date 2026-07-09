@@ -1,0 +1,20 @@
+name: ExDDI
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch/
+  - defaults
+dependencies:
+  - fsspec
+  - kagglehub
+  - matplotlib
+  - notebook
+  - numpy=1.26.4
+  - openai
+  - pandas
+  - python=3.9
+  - pyyaml
+  - scikit-learn=1.0
+  - sentence-transformers
+  - tiktoken
+prefix: /root/miniconda3/envs/ExDDI

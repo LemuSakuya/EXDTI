@@ -1,0 +1,73 @@
+# Local agent/editor state
+.claude/
+.nested-project-config-backup/
+.vscode/
+.idea/
+
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments / Conda
+.venv/
+venv/
+env/
+ENV/
+.conda/
+.exddi-conda/
+*.egg-info/
+
+# Runtime outputs and service caches
+output/
+*output*/
+wandb/
+hf_cache/
+.cache/
+*.log
+
+# Build artifacts
+build/
+dist/
+
+# Large/raw data excluded from GitHub
+full database.xml
+drugbank_dti*.json
+data/**
+!data/
+!data/dti_template/
+!data/dti_template/sample_dti.json
+dataset/**
+!dataset/
+!dataset/samples.json
+
+# Model checkpoints and binary arrays
+*.sqlite
+*.sqlite3
+*.db
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+
+# Package/binary artifacts
+*.dll
+*.lib
+*.so
+*.dylib
+
+# Jupyter and OS metadata
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
